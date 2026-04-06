@@ -1,0 +1,113 @@
+name: Upstream Sync
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # Daily at 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout mpired branch
+        uses: actions/checkout@v4
+        with:
+          ref: mpired
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/paperclipai/paperclip.git
+          git fetch upstream master
+
+      - name: Check for new commits
+        id: check
+        run: |
+          UPSTREAM_SHA=$(git rev-parse upstream/master)
+          # Check if upstream/master is already an ancestor of mpired
+          if git merge-base --is-ancestor upstream/master HEAD; then
+            echo "new_commits=false" >> "$GITHUB_OUTPUT"
+            echo "No new upstream commits."
+          else
+            echo "new_commits=true" >> "$GITHUB_OUTPUT"
+            echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
+            COMMIT_COUNT=$(git rev-list HEAD..upstream/master --count)
+            echo "commit_count=${COMMIT_COUNT}" >> "$GITHUB_OUTPUT"
+            echo "Found ${COMMIT_COUNT} new upstream commits."
+          fi
+
+      - name: Attempt merge
+        if: steps.check.outputs.new_commits == 'true'
+        id: merge
+        run: |
+          BRANCH="upstream-sync/$(date +%Y-%m-%d)"
+          git checkout -b "$BRANCH"
+          if git merge upstream/master --no-edit; then
+            echo "has_conflicts=false" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort
+            echo "has_conflicts=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Push sync branch
+        if: steps.check.outputs.new_commits == 'true'
+        run: |
+          git push origin "${{ steps.merge.outputs.branch }}"
+
+      - name: Create PR (clean merge)
+        if: steps.check.outputs.new_commits == 'true' && steps.merge.outputs.has_conflicts == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create \
+            --base mpired \
+            --head "${{ steps.merge.outputs.branch }}" \
+            --title "Upstream sync: ${{ steps.check.outputs.commit_count }} new commits" \
+            --body "Automated sync from \`paperclipai/paperclip:master\`.
+
+          **Commits:** ${{ steps.check.outputs.commit_count }}
+          **Upstream SHA:** \`${{ steps.check.outputs.upstream_sha }}\`
+          **Merge status:** Clean merge - ready to review and merge.
+
+          After merging, run \`pnpm install\` locally to regenerate the lock file if needed." \
+            --label "upstream-sync"
+
+      - name: Create PR (with conflicts)
+        if: steps.check.outputs.new_commits == 'true' && steps.merge.outputs.has_conflicts == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Push the branch without the failed merge (just the base)
+          git checkout -B "${{ steps.merge.outputs.branch }}" mpired
+          git push origin "${{ steps.merge.outputs.branch }}" --force
+
+          gh pr create \
+            --base mpired \
+            --head "${{ steps.merge.outputs.branch }}" \
+            --title "Upstream sync: ${{ steps.check.outputs.commit_count }} new commits (conflicts)" \
+            --body "Automated sync from \`paperclipai/paperclip:master\`.
+
+          **Commits:** ${{ steps.check.outputs.commit_count }}
+          **Upstream SHA:** \`${{ steps.check.outputs.upstream_sha }}\`
+          **Merge status:** Has conflicts - manual resolution required.
+
+          To resolve:
+          \`\`\`bash
+          git fetch upstream master
+          git checkout ${{ steps.merge.outputs.branch }}
+          git merge upstream/master
+          # resolve conflicts
+          git push
+          \`\`\`" \
+            --label "upstream-sync" \
+            --label "has-conflicts"
