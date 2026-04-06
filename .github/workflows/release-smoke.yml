@@ -37,6 +37,7 @@ on:
 
 jobs:
   smoke:
+    if: false # Disabled in MPired fork — not publishing releases
     runs-on: ubuntu-latest
     timeout-minutes: 45
 

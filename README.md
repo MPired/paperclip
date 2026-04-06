@@ -1,3 +1,5 @@
+> **Fork Notice:** This is [MPired's managed fork](https://github.com/MPired/paperclip) of [Paperclip AI](https://github.com/paperclipai/paperclip). The `mpired` branch contains custom changes; `master` mirrors upstream. Upstream syncs happen daily via GitHub Actions.
+
 <p align="center">
   <img src="doc/assets/header.png" alt="Paperclip — runs your business" width="720" />
 </p>
