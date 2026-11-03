@@ -70,6 +70,7 @@ const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
+const DEAD_PROCESS_REAP_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes -- force-reap runs whose child PID is dead even if executeRun() is still awaiting
 const startLocksByAgent = new Map<string, Promise<void>>();
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
@@ -2036,8 +2037,9 @@ export function heartbeatService(db: Db) {
     }
   }
 
-  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
+  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; isStartup?: boolean }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
+    const isStartup = opts?.isStartup ?? false;
     const now = new Date();
 
     // Find all runs stuck in "running" state (queued runs are legitimately waiting; resumeQueuedRuns handles them)
@@ -2053,7 +2055,26 @@ export function heartbeatService(db: Db) {
     const reaped: string[] = [];
 
     for (const { run, adapterType } of activeRuns) {
-      if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
+      const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
+      const childDead = tracksLocalChild && !!run.processPid && !isProcessAlive(run.processPid);
+
+      // If the run is tracked in-memory by executeRun(), normally skip it -- the
+      // promise chain will clean up when it settles.  However, if the child process
+      // is confirmed dead and the run has been "running" for longer than
+      // DEAD_PROCESS_REAP_THRESHOLD_MS, the promise is likely leaked (e.g. the
+      // logChain inside the adapter never resolved).  Force-reap it.
+      if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) {
+        if (!childDead) continue;
+        const runAge = now.getTime() - new Date(run.startedAt ?? run.createdAt).getTime();
+        if (runAge < DEAD_PROCESS_REAP_THRESHOLD_MS) continue;
+        // Force-clean the leaked in-memory handles so the reaper can proceed.
+        activeRunExecutions.delete(run.id);
+        runningProcesses.delete(run.id);
+        logger.warn(
+          { runId: run.id, agentId: run.agentId, processPid: run.processPid, runAgeMs: runAge },
+          "force-reaping run: child process dead but executeRun promise was still tracked",
+        );
+      }
 
       // Apply staleness threshold to avoid false positives
       if (staleThresholdMs > 0) {
@@ -2061,27 +2082,41 @@ export function heartbeatService(db: Db) {
         if (now.getTime() - refTime < staleThresholdMs) continue;
       }
 
-      const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
-      if (tracksLocalChild && run.processPid && isProcessAlive(run.processPid)) {
-        if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {
-          const detachedMessage = `Lost in-memory process handle, but child pid ${run.processPid} is still alive`;
-          const detachedRun = await setRunStatus(run.id, "running", {
-            error: detachedMessage,
-            errorCode: DETACHED_PROCESS_ERROR_CODE,
-          });
-          if (detachedRun) {
-            await appendRunEvent(detachedRun, await nextRunEventSeq(detachedRun.id), {
-              eventType: "lifecycle",
-              stream: "system",
-              level: "warn",
-              message: detachedMessage,
-              payload: {
-                processPid: run.processPid,
-              },
+      if (tracksLocalChild && run.processPid && isProcessAlive(run.processPid) && !isStartup) {
+        // PID appears alive but could be a recycled PID. If the run has already been
+        // marked as detached and has been running for longer than the dead-process
+        // threshold, force-reap it — the original child is almost certainly gone and
+        // a different process now holds this PID.
+        // At startup (isStartup=true) we skip this block entirely: this server didn't
+        // spawn ANY processes yet, so a live PID is always a different process.
+        const runAge = now.getTime() - new Date(run.startedAt ?? run.createdAt).getTime();
+        if (run.errorCode === DETACHED_PROCESS_ERROR_CODE && runAge >= DEAD_PROCESS_REAP_THRESHOLD_MS) {
+          logger.warn(
+            { runId: run.id, agentId: run.agentId, processPid: run.processPid, runAgeMs: runAge },
+            "force-reaping detached run: PID likely recycled (run exceeded dead-process threshold)",
+          );
+          // Fall through to the reap logic below.
+        } else {
+          if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {
+            const detachedMessage = `Lost in-memory process handle, but child pid ${run.processPid} is still alive`;
+            const detachedRun = await setRunStatus(run.id, "running", {
+              error: detachedMessage,
+              errorCode: DETACHED_PROCESS_ERROR_CODE,
             });
+            if (detachedRun) {
+              await appendRunEvent(detachedRun, await nextRunEventSeq(detachedRun.id), {
+                eventType: "lifecycle",
+                stream: "system",
+                level: "warn",
+                message: detachedMessage,
+                payload: {
+                  processPid: run.processPid,
+                },
+              });
+            }
           }
+          continue;
         }
-        continue;
       }
 
       const shouldRetry = tracksLocalChild && !!run.processPid && (run.processLossRetryCount ?? 0) < 1;

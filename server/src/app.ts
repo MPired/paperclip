@@ -30,6 +30,7 @@ import { assetRoutes } from "./routes/assets.js";
 import { accessRoutes } from "./routes/access.js";
 import { pluginRoutes } from "./routes/plugins.js";
 import { adapterRoutes } from "./routes/adapters.js";
+import { slackInteractivityRoutes } from "./routes/slack-interactivity.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { applyUiBranding } from "./ui-branding.js";
 import { logger } from "./middleware/logger.js";
@@ -96,6 +97,11 @@ export async function createApp(
     },
   }));
   app.use(httpLogger);
+
+  // Slack interactivity webhook — mounted before auth/hostname guards
+  // because Slack POSTs here from their servers, not from our UI.
+  app.use(slackInteractivityRoutes());
+
   const privateHostnameGateEnabled =
     opts.deploymentMode === "authenticated" && opts.deploymentExposure === "private";
   const privateHostnameAllowSet = resolvePrivateHostnameAllowSet({

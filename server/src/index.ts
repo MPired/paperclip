@@ -581,7 +581,7 @@ export async function startServer(): Promise<StartedServer> {
     // Reap orphaned running runs at startup while in-memory execution state is empty,
     // then resume any persisted queued runs that were waiting on the previous process.
     void heartbeat
-      .reapOrphanedRuns()
+      .reapOrphanedRuns({ isStartup: true })
       .then(() => heartbeat.resumeQueuedRuns())
       .catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
